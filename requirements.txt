@@ -1,6 +1,9 @@
+Flask
 flask-restx
-herepy
+flask-cors
 pymongo
+requests
 folium
 flexpolyline
 pandas
+python-dotenv

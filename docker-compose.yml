@@ -8,38 +8,40 @@ services:
     container_name: "intertwino_api"
     ports:
       - "${API_PORT}:5000"
-    restart: always
+    restart: no
     environment:
       FLASK_DEBUG: 1
+      MONGO_HOST: mongo
+      MONGO_PORT: 27017
+      MONGO_USER: ${MONGO_USER}
+      MONGO_PASSWORD: ${MONGO_PASSWORD}
+      MONGO_DBNAME: ${MONGO_DBNAME}
+      API_TOKEN: ${API_TOKEN}
+      GEOAPIFY_API_KEY: ${GEOAPIFY_API_KEY}  # Add this line
     env_file:
       - ./.env  
     volumes:
-      - .:/code  
+      - .:/code
+    depends_on:
+      - mongo
+    networks:
+      - app-network
       
   mongo:
     image: "mongo:${MONGO_VERSION}"
     container_name: "intertwino_mongo"
     ports:
       - "${MONGO_PORT}:27017"
-    restart: always
+    restart: no
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
     volumes:
       - ./mongo-data:/data/db
-      - ~/my-data:/my-data
-    
-  jupyter:
-    image: "jupyter/datascience-notebook:${JUPYTER_VERSION}"
-    container_name: intertwino_jupyter
-    ports:
-      - "${MY_JUPYTER_PORT}:8888"
-    restart: always  
-    environment:
-      JUPYTER_ENABLE_LAB: "yes"
-    env_file:
-      - ./.env
-    volumes:
-      - ./work:/home/jovyan/work
-      - ~/my-data:/home/jovyan/work/my-data
-      
+      - ./mongo-init:/docker-entrypoint-initdb.d
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge

@@ -1,62 +1,140 @@
-from flask import Flask, request
-from flask_restx import Api, Resource, reqparse, fields
-from herepy import GeocoderApi
-from pymongo import MongoClient
 import os
+from flask import Flask, request, jsonify
+from flask_restx import Api, Resource, reqparse, fields
+from flask_cors import CORS
+from pymongo import MongoClient
 import json
 import requests
 import folium
 import flexpolyline as fp
 import pandas as pd
+import logging
+import time
 
-API_TOKEN = os.environ["API_TOKEN"]
-HERE_API_KEY = os.environ["HERE_API_KEY"]
-geocoder_api = GeocoderApi(api_key=HERE_API_KEY)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-MONGO_HOST = os.environ["MONGO_HOST"]
+def get_env_variable(var_name):
+    try:
+        return os.environ[var_name]
+    except KeyError:
+        error_msg = f"Error: {var_name} environment variable not set."
+        logger.error(error_msg)
+        raise Exception(error_msg)
+
+API_TOKEN = get_env_variable("API_TOKEN")
+GEOAPIFY_API_KEY = get_env_variable("GEOAPIFY_API_KEY")
+
+MONGO_HOST = os.environ.get("MONGO_HOST", "intertwino_mongo")
+MONGO_PORT = int(os.environ.get("MONGO_PORT", 27017))
 MONGO_USER = os.environ["MONGO_USER"]
 MONGO_PASSWORD = os.environ["MONGO_PASSWORD"]
 MONGO_DBNAME = os.environ["MONGO_DBNAME"]
-client = MongoClient(MONGO_HOST,
+
+client = MongoClient(f"mongodb://{MONGO_HOST}:{MONGO_PORT}/",
                      username=MONGO_USER,
                      password=MONGO_PASSWORD,
                      authSource='admin',
-                     authMechanism='SCRAM-SHA-256')
+                     authMechanism='SCRAM-SHA-256', 
+                     maxPoolSize=100)
 address_cache = client[MONGO_DBNAME].address            
 route_cache = client[MONGO_DBNAME].route                  
-poi_cache = client[MONGO_DBNAME].poi                  
+poi_cache = client[MONGO_DBNAME].poi 
 
-
-
-with open("municipalities.geojson.json") as f:
+current_dir = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(current_dir, "municipalities.geojson.json")) as f:
     geodata = json.loads(f.read())
 temp = geodata["features"]
 sofia_geoshape = [t for t in temp if "SOF" in t["properties"]["nuts4"]]
 
-
 app = Flask(__name__)
-api = Api(app)
+CORS(app)  # Enable CORS for all domains on all routes
+api = Api(app, prefix='/api')
 
+# Global variables for tracking cache hits, misses, and API calls
+cache_hits = 0
+cache_misses = 0
+api_call_count = 0
+
+# Determine whether to use caching based on an environment variable
+USE_CACHE = os.getenv('USE_CACHE', 'true').lower() == 'true'
 
 def validate_token(token):
     return token == API_TOKEN
-    
+
 def get_address_data(address):
+    global cache_hits, cache_misses
     address = address.lower()
-    result = address_cache.find_one({"address": address})
+    start_time = time.time()
+    result = address_cache.find_one({"address": address}) if USE_CACHE else None
+    end_time = time.time()
+    if result:
+        cache_hits += 1
+        logger.info(f"Cache hit for address: {address}")
+    else:
+        cache_misses += 1
+        logger.info(f"Cache miss for address: {address}")
+    logger.info(f"Address lookup time: {end_time - start_time:.4f} seconds")
     return result
 
 def get_route_data(origin, destination):
-    result = route_cache.find_one({"origin": origin, "destination": destination})
+    result = route_cache.find_one({"origin": origin, "destination": destination}) if USE_CACHE else None
     return result
 
 def get_poi(name):
     name = name.lower().replace('"', '')
-    name = name.replace('“', '')
+    name = name.replace('"', '')
     name = " ".join(name.split())
-    result = poi_cache.find_one({"name": name})
+    result = poi_cache.find_one({"name": name}) if USE_CACHE else None
     return result
 
+def transform_geoapify_to_here_format(geoapify_response):
+    """
+    Transform Geoapify response to match the HERE API response format
+    """
+    items = []
+    for feature in geoapify_response.get("features", []):
+        properties = feature.get("properties", {})
+        geometry = feature.get("geometry", {})
+        
+        # Transform to HERE-like format
+        item = {
+            "title": properties.get("formatted"),
+            "id": properties.get("place_id"),
+            "resultType": properties.get("result_type", "unknown"),
+            "address": {
+                "label": properties.get("formatted"),
+                "countryCode": properties.get("country_code"),
+                "countryName": properties.get("country"),
+                "state": properties.get("state"),
+                "county": properties.get("county"),
+                "city": properties.get("city"),
+                "district": properties.get("district"),
+                "street": properties.get("street"),
+                "postalCode": properties.get("postcode"),
+                "houseNumber": properties.get("housenumber")
+            },
+            "position": {
+                "lat": geometry.get("coordinates", [])[1] if geometry.get("coordinates") else properties.get("lat"),
+                "lng": geometry.get("coordinates", [])[0] if geometry.get("coordinates") else properties.get("lon")
+            },
+            "access": [
+                {
+                    "lat": geometry.get("coordinates", [])[1] if geometry.get("coordinates") else properties.get("lat"),
+                    "lng": geometry.get("coordinates", [])[0] if geometry.get("coordinates") else properties.get("lon")
+                }
+            ] if geometry.get("coordinates") else [],
+            "mapView": {
+                "west": properties.get("bbox", {}).get("lon1") or (properties.get("lon") - 0.01),
+                "south": properties.get("bbox", {}).get("lat1") or (properties.get("lat") - 0.01),
+                "east": properties.get("bbox", {}).get("lon2") or (properties.get("lon") + 0.01),
+                "north": properties.get("bbox", {}).get("lat2") or (properties.get("lat") + 0.01)
+            }
+        }
+        items.append(item)
+    
+    return {"items": items}
 
 address_fields = api.model('Address', {
     'address': fields.String,
@@ -71,7 +149,11 @@ address_list_fields = api.model('AddressList', {
         ])
 })
 
-@api.route('/geocoords')
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+@api.route('/reconciliators/geocodingHere')
 @api.doc(
     responses={200: "OK", 404: "Not found",
                400: "Bad request", 403: "Invalid token"},
@@ -80,13 +162,37 @@ address_list_fields = api.model('AddressList', {
 class GeolocateAddress(Resource):
 
     def lookup_address(self, address):
-        response = geocoder_api.free_form(address)
-        results = response.as_dict()
-        address_cache.insert_one({
-            "address": address.lower(),
-            "items": results["items"]
-        })
-        return results
+        global api_call_count
+        api_call_count += 1
+        logger.info(f"API call count: {api_call_count}")
+        
+        # Use Geoapify Geocoding API
+        url = "https://api.geoapify.com/v1/geocode/search"
+        params = {
+            "text": address,
+            "format": "json",
+            "apiKey": GEOAPIFY_API_KEY,
+            "lang": "bg",  # Bulgarian language
+            "limit": 10
+        }
+        
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            results = response.json()
+            
+            # Transform Geoapify response to HERE-like format
+            transformed_results = transform_geoapify_to_here_format(results)
+            
+            if USE_CACHE:
+                address_cache.insert_one({
+                    "address": address.lower(),
+                    "items": transformed_results["items"]
+                })
+            return transformed_results
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Geoapify API error: {str(e)}")
+            raise Exception(f"Geocoding service error: {str(e)}")
     
     def init_geo_obj_debug(self):
         geo_obj_debug = {}
@@ -140,7 +246,6 @@ class GeolocateAddress(Resource):
         out["debug"] = geo_obj_debug
         return out    
 
-
     @api.doc(
         body = address_list_fields,
         description="""With this API endpoint you can search for addresses by entering a json array of object 
@@ -150,31 +255,36 @@ class GeolocateAddress(Resource):
     )
     def post(self):
         parser = reqparse.RequestParser()
-        parser.add_argument('token', type=str, help='variable 1', location='args')
+        parser.add_argument('token', type=str, help='API token', location='args')
         args = parser.parse_args()
         token = args["token"]
         if not validate_token(token):
             return {"Error": "Invalid Token"}, 403
         try:
-            addresses = request.get_json()['json']
-        except:
-            return {"Error": "Invalid Json"}, 400
+            data = request.get_json()
+            if 'json' not in data:
+                return {"Error": "Missing 'json' key in request body"}, 400
+            addresses = data['json']
+        except Exception as e:
+            logger.error(f"Error parsing JSON: {str(e)}")
+            return {"Error": "Invalid JSON"}, 400
+        
         geo_obj_debug = self.init_geo_obj_debug()      
         for address in addresses:
-            result = get_address_data(address["address"])
-            if result is None:
-                try:
+            try:
+                result = get_address_data(address["address"])
+                if result is None:
                     result = self.lookup_address(address["address"])
-                except Exception as e:   
-                    return {"Error": str(e)}, 400 
-            address["items"] = result["items"]
-            self.populate_debug(result, geo_obj_debug)
+                address["items"] = result["items"]
+                self.populate_debug(result, geo_obj_debug)
+            except Exception as e:   
+                logger.error(f"Error processing address {address}: {str(e)}")
+                return {"Error": f"Error processing address: {str(e)}"}, 400 
         out = {
             "result": addresses,
             "debug": geo_obj_debug
         }    
         return out
-
 
 routes_fields = api.model('Route', {
     'origin': fields.List(fields.Float),
@@ -191,7 +301,6 @@ routes_list_fields = api.model('RouteList', {
         ])
 })
 
-
 @api.route('/route')
 @api.doc(
     responses={200: "OK", 404: "Not found",
@@ -200,31 +309,79 @@ routes_list_fields = api.model('RouteList', {
         "token": "token api key"
     }
 )
+
 class Routing(Resource):
 
     def get_route(self, origin, destination):
-        query = {
-            "transportMode": "pedestrian", 
-            "origin": origin, 
-            "destination": destination, 
-            "return": "summary,polyline", 
-            "apiKey": HERE_API_KEY
+        # Use Geoapify Routing API
+        url = "https://api.geoapify.com/v1/routing"
+        params = {
+            "waypoints": f"{origin}|{destination}",
+            "mode": "walk",
+            "apiKey": GEOAPIFY_API_KEY,
+            "details": "instruction_details"
         }
-        result = requests.get("https://router.hereapi.com/v8/routes", params=query)
-        result = result.json()
-        route_cache.insert_one({
-            "origin": origin,
-            "destination": destination,
-            "routes": result["routes"]
-        })
         
-        return result  
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            result = response.json()
+            
+            # Transform Geoapify routing response to match expected format
+            transformed_result = self.transform_routing_response(result)
+            
+            if USE_CACHE:
+                route_cache.insert_one({
+                    "origin": origin,
+                    "destination": destination,
+                    "routes": transformed_result["routes"]
+                })
+            
+            return transformed_result
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Geoapify Routing API error: {str(e)}")
+            raise Exception(f"Routing service error: {str(e)}")
+    
+    def transform_routing_response(self, geoapify_response):
+        """
+        Transform Geoapify routing response to match HERE routing response format
+        """
+        routes = []
+        
+        for feature in geoapify_response.get("features", []):
+            properties = feature.get("properties", {})
+            
+            # Extract summary information
+            summary = {
+                "duration": properties.get("time", 0),
+                "length": properties.get("distance", 0)
+            }
+            
+            # Extract polyline (Geoapify uses encoded polyline)
+            polyline = properties.get("legs", [{}])[0].get("points") if properties.get("legs") else ""
+            
+            route = {
+                "sections": [
+                    {
+                        "id": "section-0",
+                        "type": "pedestrian",
+                        "actions": [],
+                        "arrival": {"time": ""},
+                        "departure": {"time": ""},
+                        "summary": summary,
+                        "polyline": polyline
+                    }
+                ]
+            }
+            routes.append(route)
+        
+        return {"routes": routes}
 
     @api.doc(
         params={
-            "pointA": "Geocoords of point A (use oder lat,lng separeted to comma for e.g. 42.69357,23.36488)",
+            "pointA": "Geocoords of point A (use order lat,lng separated by comma for e.g. 42.69357,23.36488)",
             "pointB": """Geocoords of point B or Point of Interest 
-            (use order lat,lng separated to comma for e.g. 42.70214,23.37594 or ДГ №20 "Жасминов парк")"""
+            (use order lat,lng separated by comma for e.g. 42.70214,23.37594 or ДГ №20 "Жасминов парк")"""
         },
         description='Compute path from point A to point B in pedestrian mode'
     )
@@ -263,34 +420,41 @@ class Routing(Resource):
     )
     def post(self):
         parser = reqparse.RequestParser()
-        parser.add_argument('token', type=str, help='variable 1', location='args')
+        parser.add_argument('token', type=str, help='API token', location='args')
         args = parser.parse_args()
         token = args["token"]
         if not validate_token(token):
             return {"Error": "Invalid Token"}, 403
         try:
-            routes = request.get_json()['json']
-        except:
-            return {"Error": "Invalid Json"}, 400
+            data = request.get_json()
+            if 'json' not in data:
+                return {"Error": "Missing 'json' key in request body"}, 400
+            routes = data['json']
+        except Exception as e:
+            logger.error(f"Error parsing JSON: {str(e)}")
+            return {"Error": "Invalid JSON"}, 400
 
         for route in routes:
-            if type(route["destination"]) == str:
-                school = get_poi(route["destination"])
-                if school is None:
-                    return {"Error": "Invalid Point of Interest name"}, 400   
-                else:
+            try:
+                if isinstance(route["destination"], str):
+                    school = get_poi(route["destination"])
+                    if school is None:
+                        return {"Error": f"Invalid Point of Interest name: {route['destination']}"}, 400   
                     route["destination"] = school["coords"].split(",")
-            origin, destination = (",".join([str(p) for p in route["origin"]]), ",".join([str(p) for p in route["destination"]]))
-            result = get_route_data(origin, destination)
-            if result is None:
-                try:
+                origin = ",".join(str(p) for p in route["origin"])
+                destination = ",".join(str(p) for p in route["destination"])
+                result = get_route_data(origin, destination)
+                if result is None:
                     result = self.get_route(origin, destination)
-                except Exception as e:   
-                    return {"Error": str(e)}, 400 
-            route["routes"] = result["routes"]
+                route["routes"] = result["routes"]
+            except KeyError as e:
+                logger.error(f"KeyError in route data: {str(e)}")
+                return {"Error": f"Missing key in route data: {str(e)}"}, 400
+            except Exception as e:   
+                logger.error(f"Error processing route {route}: {str(e)}")
+                return {"Error": f"Error processing route: {str(e)}"}, 400 
        
         return routes
-
 
 @app.route('/map')
 def map():
@@ -317,6 +481,15 @@ def map():
         return {"Error": "Invalid Polyline"}
     return m._repr_html_()
 
+@app.route('/metrics')
+def metrics():
+    cache_hit_rate = cache_hits / (cache_hits + cache_misses) if (cache_hits + cache_misses) > 0 else 0
+    return jsonify({
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "cache_hit_rate": cache_hit_rate,
+        "api_call_count": api_call_count
+    }), 200
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
