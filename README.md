@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # InterTwino GeoNames API Setup Guide
 
 ## Overview
@@ -290,6 +289,4 @@ InterTwino-project/
 - [GeoNames Documentation](http://www.geonames.org/export/)
 - [MongoDB Documentation](https://docs.mongodb.com/)
 - [Flask Documentation](https://flask.palletsprojects.com/)
-=======
-# Semt-Geoservice
->>>>>>> 05902f8916077199f0fe08144c6d35434d16204a
+
