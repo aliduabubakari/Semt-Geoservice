@@ -91,49 +91,110 @@ def get_poi(name):
 
 def transform_geoapify_to_here_format(geoapify_response):
     """
-    Transform Geoapify response to match the HERE API response format
+    Transform Geoapify response to match the HERE API response format.
+    Accepts either GeoJSON FeatureCollection (with 'features') or plain JSON ('results' list).
     """
     items = []
-    for feature in geoapify_response.get("features", []):
-        properties = feature.get("properties", {})
-        geometry = feature.get("geometry", {})
-        
-        # Transform to HERE-like format
-        item = {
-            "title": properties.get("formatted"),
-            "id": properties.get("place_id"),
-            "resultType": properties.get("result_type", "unknown"),
-            "address": {
-                "label": properties.get("formatted"),
-                "countryCode": properties.get("country_code"),
-                "countryName": properties.get("country"),
-                "state": properties.get("state"),
-                "county": properties.get("county"),
-                "city": properties.get("city"),
-                "district": properties.get("district"),
-                "street": properties.get("street"),
-                "postalCode": properties.get("postcode"),
-                "houseNumber": properties.get("housenumber")
-            },
-            "position": {
-                "lat": geometry.get("coordinates", [])[1] if geometry.get("coordinates") else properties.get("lat"),
-                "lng": geometry.get("coordinates", [])[0] if geometry.get("coordinates") else properties.get("lon")
-            },
-            "access": [
-                {
-                    "lat": geometry.get("coordinates", [])[1] if geometry.get("coordinates") else properties.get("lat"),
-                    "lng": geometry.get("coordinates", [])[0] if geometry.get("coordinates") else properties.get("lon")
-                }
-            ] if geometry.get("coordinates") else [],
-            "mapView": {
-                "west": properties.get("bbox", {}).get("lon1") or (properties.get("lon") - 0.01),
-                "south": properties.get("bbox", {}).get("lat1") or (properties.get("lat") - 0.01),
-                "east": properties.get("bbox", {}).get("lon2") or (properties.get("lon") + 0.01),
-                "north": properties.get("bbox", {}).get("lat2") or (properties.get("lat") + 0.01)
+
+    def to_here_item(src, is_feature):
+        if is_feature:
+            properties = (src.get("properties") or {})
+            geometry = (src.get("geometry") or {})
+            coords = geometry.get("coordinates") or []
+            lat = coords[1] if len(coords) >= 2 else properties.get("lat")
+            lng = coords[0] if len(coords) >= 2 else properties.get("lon")
+            rank = (properties.get("rank") or {})
+            label = (
+                properties.get("formatted")
+                or properties.get("name")
+                or properties.get("address_line1")
+                or properties.get("address_line2")
+                or ""
+            )
+            bbox = properties.get("bbox")  # [west, south, east, north]
+            if isinstance(bbox, list) and len(bbox) == 4:
+                map_view = {"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]}
+            else:
+                map_view = {"west": (lng - 0.01) if lng is not None else None,
+                            "south": (lat - 0.01) if lat is not None else None,
+                            "east": (lng + 0.01) if lng is not None else None,
+                            "north": (lat + 0.01) if lat is not None else None}
+
+            return {
+                "title": label,
+                "id": properties.get("place_id"),
+                "resultType": properties.get("result_type", "unknown"),
+                "address": {
+                    "label": label,
+                    "countryCode": properties.get("country_code"),
+                    "countryName": properties.get("country"),
+                    "state": properties.get("state"),
+                    "county": properties.get("county"),
+                    "city": properties.get("city"),
+                    "district": properties.get("district"),
+                    "street": properties.get("street"),
+                    "postalCode": properties.get("postcode"),
+                    "houseNumber": properties.get("housenumber"),
+                },
+                "position": {"lat": lat, "lng": lng},
+                "access": [{"lat": lat, "lng": lng}] if lat is not None and lng is not None else [],
+                "mapView": map_view,
+                "scoring": {"queryScore": rank.get("confidence", 0) or properties.get("confidence", 0) or 0},
             }
-        }
-        items.append(item)
-    
+        else:
+            # format=json -> 'results' entries (flat shape)
+            lat = src.get("lat")
+            lng = src.get("lon")
+            rank = (src.get("rank") or {})
+            label = (
+                src.get("formatted")
+                or src.get("name")
+                or src.get("address_line1")
+                or src.get("address_line2")
+                or ""
+            )
+            bbox = src.get("bbox")
+            if isinstance(bbox, list) and len(bbox) == 4:
+                map_view = {"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]}
+            else:
+                map_view = {"west": (lng - 0.01) if lng is not None else None,
+                            "south": (lat - 0.01) if lat is not None else None,
+                            "east": (lng + 0.01) if lng is not None else None,
+                            "north": (lat + 0.01) if lat is not None else None}
+
+            return {
+                "title": label,
+                "id": src.get("place_id"),
+                "resultType": src.get("result_type", "unknown"),
+                "address": {
+                    "label": label,
+                    "countryCode": src.get("country_code"),
+                    "countryName": src.get("country"),
+                    "state": src.get("state"),
+                    "county": src.get("county"),
+                    "city": src.get("city"),
+                    "district": src.get("district"),
+                    "street": src.get("street"),
+                    "postalCode": src.get("postcode"),
+                    "houseNumber": src.get("housenumber"),
+                },
+                "position": {"lat": lat, "lng": lng},
+                "access": [{"lat": lat, "lng": lng}] if lat is not None and lng is not None else [],
+                "mapView": map_view,
+                "scoring": {"queryScore": rank.get("confidence", 0) or src.get("confidence", 0) or 0},
+            }
+
+    if isinstance(geoapify_response, dict) and "features" in geoapify_response:
+        for feature in geoapify_response.get("features", []):
+            item = to_here_item(feature, is_feature=True)
+            if item["position"]["lat"] is not None and item["position"]["lng"] is not None:
+                items.append(item)
+    elif isinstance(geoapify_response, dict) and "results" in geoapify_response:
+        for result in geoapify_response.get("results", []):
+            item = to_here_item(result, is_feature=False)
+            if item["position"]["lat"] is not None and item["position"]["lng"] is not None:
+                items.append(item)
+
     return {"items": items}
 
 address_fields = api.model('Address', {
@@ -170,9 +231,8 @@ class GeolocateAddress(Resource):
         url = "https://api.geoapify.com/v1/geocode/search"
         params = {
             "text": address,
-            "format": "json",
             "apiKey": GEOAPIFY_API_KEY,
-            "lang": "bg",  # Bulgarian language
+            "lang": "bg",
             "limit": 10
         }
         

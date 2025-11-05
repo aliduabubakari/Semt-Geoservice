@@ -289,4 +289,3 @@ InterTwino-project/
 - [GeoNames Documentation](http://www.geonames.org/export/)
 - [MongoDB Documentation](https://docs.mongodb.com/)
 - [Flask Documentation](https://flask.palletsprojects.com/)
-
